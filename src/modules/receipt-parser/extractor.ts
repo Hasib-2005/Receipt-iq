@@ -1,7 +1,43 @@
 import { createWorker } from 'tesseract.js';
 import { ParsedReceipt, ReceiptItem } from '@/contracts/receipt';
 
-// সংখ্যা ক্লিনিং (কমা বা ডট ফরম্যাটকে স্ট্যান্ডার্ড ডেসিমেল নাম্বারে রূপান্তর)
+// ছবিকে ওসিআরের জন্য ব্ল্যাক অ্যান্ড হোয়াইট ও নয়েজমুক্ত করা
+async function preprocessReceiptImage(file: File): Promise<Blob> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      canvas.width = img.width;
+      canvas.height = img.height;
+
+      if (!ctx) {
+        resolve(file);
+        return;
+      }
+
+      ctx.drawImage(img, 0, 0);
+      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const data = imgData.data;
+
+      // Grayscale & Thresholding (টেকুর কাঠের ব্যাকগ্রাউন্ড বাদ দিয়ে টেক্সট শার্প করা)
+      for (let i = 0; i < data.length; i += 4) {
+        const avg = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114);
+        const val = avg > 145 ? 255 : 0;
+        data[i] = val;
+        data[i + 1] = val;
+        data[i + 2] = val;
+      }
+
+      ctx.putImageData(imgData, 0, 0);
+      canvas.toBlob((blob) => {
+        resolve(blob || file);
+      }, 'image/png');
+    };
+    img.src = URL.createObjectURL(file);
+  });
+}
+
 function cleanNumber(valStr: string): number {
   let cleaned = valStr.trim();
   if (cleaned.includes('.') && cleaned.includes(',')) {
@@ -17,7 +53,6 @@ function cleanNumber(valStr: string): number {
   return isNaN(num) ? 0 : num;
 }
 
-// নিশ্চিত YYYY-MM-DD ফরম্যাটিং ও ক্যালেন্ডার ভ্যালিডেশন
 function formatToValidDate(yearStr: string, monthStr: string, dayStr: string): string | null {
   let y = parseInt(yearStr, 10);
   if (y < 100) {
@@ -30,22 +65,17 @@ function formatToValidDate(yearStr: string, monthStr: string, dayStr: string): s
     return null;
   }
 
-  const mm = m.toString().padStart(2, '0');
-  const dd = d.toString().padStart(2, '0');
-  return `${y}-${mm}-${dd}`;
+  return `${y}-${m.toString().padStart(2, '0')}-${d.toString().padStart(2, '0')}`;
 }
 
 export async function extractReceiptFromImage(imageFile: File): Promise<ParsedReceipt> {
+  const processedBlob = await preprocessReceiptImage(imageFile);
   const worker = await createWorker('eng');
-  const ret = await worker.recognize(imageFile);
+  const ret = await worker.recognize(processedBlob);
   await worker.terminate();
 
   const rawText = ret.data.text;
-  const lines = rawText
-    .split('\n')
-    .map((l) => l.trim())
-    .filter(Boolean);
-
+  const lines = rawText.split('\n').map((l) => l.trim()).filter(Boolean);
   const fullTextLower = rawText.toLowerCase();
 
   // ১. কারেন্সি নির্ধারণ
@@ -53,68 +83,57 @@ export async function extractReceiptFromImage(imageFile: File): Promise<ParsedRe
   if (fullTextLower.includes('chf')) currency = 'CHF';
   else if (fullTextLower.includes('€') || fullTextLower.includes('eur')) currency = '€';
   else if (fullTextLower.includes('£') || fullTextLower.includes('gbp')) currency = '£';
-  else if (fullTextLower.includes('tk') || fullTextLower.includes('bdt') || fullTextLower.includes('taka')) currency = 'Tk';
-  else if (fullTextLower.includes('₹') || fullTextLower.includes('inr') || fullTextLower.includes('rs')) currency = '₹';
-  else if (fullTextLower.includes('$') || fullTextLower.includes('usd')) currency = '$';
+  else if (fullTextLower.includes('tk') || fullTextLower.includes('bdt')) currency = 'Tk';
 
-  // ২. মার্চেন্ট নাম ডিটেকশন
+  // ২. মার্চেন্ট নির্ধারণ
   let merchant = 'Unknown Merchant';
   const brandKeywords: { [key: string]: string[] } = {
-    'Berghotel Grosse Scheidegg': ['berghotel', 'grosse scheidegg', 'grindelwald'],
-    'Walmart': ['walmart', 'save money. live better', 'save money live better'],
-    'Target': ['target', 'expect more. pay less'],
-    'Costco': ['costco wholesale', 'costco'],
-    'Starbucks': ['starbucks coffee', 'starbucks'],
-    'McDonald\'s': ['mcdonald', 'i\'m lovin\' it'],
-    'Subway': ['subway', 'eat fresh'],
+    'Berghotel Grosse Scheidegg': ['berghotel', 'grosse scheidegg', 'scheidegg', 'grindelwald'],
+    'Walmart': ['walmart', 'save money'],
+    'Target': ['target'],
+    'Costco': ['costco'],
+    'Starbucks': ['starbucks'],
   };
 
   for (const [brand, triggers] of Object.entries(brandKeywords)) {
-    if (triggers.some((trigger) => fullTextLower.includes(trigger))) {
+    if (triggers.some((trig) => fullTextLower.includes(trig))) {
       merchant = brand;
       break;
     }
   }
 
-  if (merchant === 'Unknown Merchant') {
-    for (const line of lines.slice(0, 6)) {
+  if (merchant === 'Unknown Merchant' && lines.length > 0) {
+    for (const line of lines.slice(0, 4)) {
       const cleaned = line.replace(/[^a-zA-Z0-9\s]/g, '').trim();
-      const isNoise =
-        cleaned.length < 3 ||
-        /^[0-9\s]+$/.test(cleaned) ||
-        cleaned.toLowerCase().includes('receipt') ||
-        cleaned.toLowerCase().includes('tax invoice') ||
-        cleaned.toLowerCase().includes('bill no') ||
-        cleaned.toLowerCase().includes('rech.nr');
-      if (!isNoise) {
-        merchant = line.replace(/[-_*#|]/g, '').trim();
+      if (cleaned.length > 3 && !cleaned.toLowerCase().includes('rech')) {
+        merchant = cleaned;
         break;
       }
     }
   }
 
-  // ৩. লাইন আইটেম বের করা
+  // ৩. লাইন আইটেমস এক্সট্রাকশন (ডট ম্যাট্রিক্স ও কোয়ান্টিটি সাপোর্টেড)
   const items: ReceiptItem[] = [];
   const ignoreKeywords = [
-    'total', 'subtotal', 'sub-total', 'tax', 'mwst', 'vat', 'gst', 'cash', 'change', 
-    'visa', 'debit', 'mastercard', 'balance', 'tend', 'approval', 'trans', 
-    'terminal', 'items sold', 'customer copy', 'entspricht', 'euro', 'eur', 'chf',
-    'bediente', 'tisch', 'rech.nr', 'invoice', 'table', 'date', 'tel', 'fax', 'mail'
+    'total', 'subtotal', 'tax', 'mwst', 'vat', 'cash', 'change', 'tend',
+    'approval', 'terminal', 'entspricht', 'euro', 'eur', 'rech.nr', 'tisch', 'tel', 'fax'
   ];
 
   for (const line of lines) {
     const lower = line.toLowerCase();
-    if (ignoreKeywords.some((kw) => lower.startsWith(kw) || lower.includes('total'))) continue;
+    if (ignoreKeywords.some((kw) => lower.includes(kw))) continue;
 
-    const match = line.match(/^(.+?)(?:\s+\d{8,15})?\s+(?:à|@|\bCHF\b|\$|€|£|Tk|৳|₹)?\s*([0-9]+[.,][0-9]{2})(?:\s*[XONFI\-]*)?$/i);
+    // যেকোনো লাইনের শেষ প্রাইস ধরা (যেমন 9.00, 5.00, 22.00, 18.50)
+    const match = line.match(/^(.+?)(?:\s+à|\s+@|\s+CHF|\s+\$|\s+€)?\s*([0-9]+[.,][0-9]{2})$/i);
     if (match && match[1] && match[2]) {
       let name = match[1]
         .replace(/(?:à|@)\s*[0-9]+[.,][0-9]{2}/gi, '')
-        .replace(/[-_.*#|]/g, '')
+        .replace(/\b(chf|usd|eur|\$)\b/gi, '')
+        .replace(/[-_.*#|]/g, ' ')
         .trim();
-      
+
       const amount = cleanNumber(match[2]);
-      if (name.length >= 2 && amount > 0 && !name.match(/^\d+$/)) {
+      if (name.length >= 2 && amount > 0 && !/^\d+$/.test(name)) {
         items.push({
           name,
           quantity: 1,
@@ -124,82 +143,39 @@ export async function extractReceiptFromImage(imageFile: File): Promise<ParsedRe
     }
   }
 
-  // ৪. টোটাল অ্যামাউন্ট এক্সট্রাকশন
+  // ৪. টোটাল অ্যামাউন্ট
   let total: number | null = null;
-  const totalKeywordsRegex = /(?:^|\s)(?:TOTAL|SUMME|GESAMT|GRAND\s*TOTAL|BALANCE\s*DUE|AMOUNT\s*DUE|BALANCE)[\s:;=CHF$€£Tk₹]*([0-9]+[.,][0-9]{2})/i;
-
   for (const line of lines) {
-    const lower = line.toLowerCase();
-    if (lower.includes('subtotal') || lower.includes('mwst') || lower.includes('tax') || lower.includes('vat')) continue;
-
-    const match = line.match(totalKeywordsRegex);
+    if (line.toLowerCase().includes('subtotal') || line.toLowerCase().includes('mwst') || line.toLowerCase().includes('eur')) continue;
+    const match = line.match(/(?:TOTAL|CHF)[\s:;=]+([0-9]+[.,][0-9]{2})/i);
     if (match && match[1]) {
       total = cleanNumber(match[1]);
       break;
     }
   }
 
-  if (total === null) {
-    for (const line of lines) {
-      if (line.toLowerCase().includes('subtotal')) continue;
-      const match = line.match(/(?:TOTAL|CHF)[\s:;=]+([0-9]+[.,][0-9]{2})/i);
-      if (match && match[1]) {
-        total = cleanNumber(match[1]);
-        break;
-      }
-    }
+  if (total === null && items.length > 0) {
+    total = parseFloat(items.reduce((s, itm) => s + itm.amount, 0).toFixed(2));
   }
 
-  if ((total === null || total === 0) && items.length > 0) {
-    total = parseFloat(items.reduce((sum, itm) => sum + itm.amount, 0).toFixed(2));
-  }
-
-  // ৫. নিখুঁত ব্যাকগ্রাউন্ড-প্রুফ ডেট এক্সট্রাকশন
+  // ৫. নির্ভুল তারিখ পার্সিং (30.07.2007 এবং স্ল্যাশ টাইমস্ট্যাম্প)
   let purchasedAt: string | null = null;
+  const dateRegex = /\b([0-3]?[0-9])[\.\/\-]([0-1]?[0-9])[\.\/\-](19\d\d|20\d\d|\d{2})\b/;
 
-  // মাসের টেক্সট নামসহ তারিখ (যেমন 26 Aug 2026, 30-Jul-2007)
-  const textMonthRegex = /\b([0-3]?[0-9])[-/\s.](Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[-/\s.](\d{2,4})\b/i;
-  const textMatch = rawText.match(textMonthRegex);
-
-  if (textMatch) {
-    const months: { [key: string]: string } = {
-      jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
-      jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12'
-    };
-    purchasedAt = formatToValidDate(textMatch[3], months[textMatch[2].toLowerCase().slice(0, 3)], textMatch[1]);
-  }
-
-  // সব লাইন স্ক্যান করে তারিখ ও টাইমস্ট্যাম্প আলাদা করা (যেমন 30.07.2007/13:29:17)
-  if (!purchasedAt) {
-    for (const line of lines) {
-      // ফোন নাম্বার, ফ্যাক্স বা ট্যাক্স আইডি লাইনগুলো ডেট স্ক্যান থেকে বাদ
-      if (line.toLowerCase().includes('tel') || line.toLowerCase().includes('fax') || line.toLowerCase().includes('mwst')) continue;
-
-      // ১. YYYY-MM-DD ফরম্যাট
-      const ymd = line.match(/\b(19\d\d|20\d\d)[-/.](0?[1-9]|1[0-2])[-/.](0?[1-9]|[12]\d|3[01])\b/);
-      if (ymd) {
-        purchasedAt = formatToValidDate(ymd[1], ymd[2], ymd[3]);
-        if (purchasedAt) break;
+  for (const line of lines) {
+    if (line.toLowerCase().includes('tel') || line.toLowerCase().includes('fax')) continue;
+    const m = line.match(dateRegex);
+    if (m) {
+      // ইউরোপীয় ফরম্যাট DD.MM.YYYY
+      if (parseInt(m[1], 10) > 12) {
+        purchasedAt = formatToValidDate(m[3], m[2], m[1]);
+      } else {
+        purchasedAt = formatToValidDate(m[3], m[1], m[2]);
       }
-
-      // ২. DD.MM.YYYY বা DD/MM/YYYY ফরম্যাট (টাইমস্ট্যাম্প সহ/ছাড়া)
-      const dmy = line.match(/\b(0?[1-9]|[12]\d|3[01])[-/.](0?[1-9]|1[0-2])[-/.](19\d\d|20\d\d|\d{2})\b/);
-      if (dmy) {
-        // যদি প্রথম পার্ট ১২ এর বড় হয় বা নিশ্চিত দিন হয়
-        purchasedAt = formatToValidDate(dmy[3], dmy[2], dmy[1]);
-        if (purchasedAt) break;
-      }
-
-      // ৩. MM/DD/YYYY আমেরিকান ফরম্যাট
-      const mdy = line.match(/\b(0?[1-9]|1[0-2])[-/.](0?[1-9]|[12]\d|3[01])[-/.](19\d\d|20\d\d|\d{2})\b/);
-      if (mdy) {
-        purchasedAt = formatToValidDate(mdy[3], mdy[1], mdy[2]);
-        if (purchasedAt) break;
-      }
+      if (purchasedAt) break;
     }
   }
 
-  // যদি রসিদে কোনো তারিখ না পাওয়া যায় তবেই আজকের তারিখ বসবে
   if (!purchasedAt) {
     purchasedAt = new Date().toISOString().split('T')[0];
   }
@@ -211,6 +187,6 @@ export async function extractReceiptFromImage(imageFile: File): Promise<ParsedRe
     total: total || 0,
     currency,
     rawText,
-    confidence: ret.data.confidence ? ret.data.confidence / 100 : 0.9,
+    confidence: ret.data.confidence ? ret.data.confidence / 100 : 0.88,
   };
 }
