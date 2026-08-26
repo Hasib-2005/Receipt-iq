@@ -9,22 +9,43 @@ export async function extractReceiptFromImage(imageFile: File): Promise<ParsedRe
   const rawText = ret.data.text;
   const lines = rawText.split('\n').map((l) => l.trim()).filter(Boolean);
 
-  // ১. Merchant Name (লোগো নয়েজ ফিল্টার)
+  // ১. নির্ভুল Merchant Name ডিটেকশন
   let merchant = 'Unknown Merchant';
-  const knownMerchants = ['walmart', 'target', 'costco', 'starbucks', 'dhaba', 'mcdonald'];
-  
-  for (const line of lines.slice(0, 8)) {
-    const matched = knownMerchants.find((m) => line.toLowerCase().includes(m));
-    if (matched) {
-      merchant = matched.toUpperCase();
+  const fullTextLower = rawText.toLowerCase();
+
+  // পরিচিত বড় ব্র্যান্ড ও স্লোগান ম্যাপিং
+  const brandKeywords: { [key: string]: string[] } = {
+    'Walmart': ['walmart', 'save money. live better', 'save money live better'],
+    'Target': ['target', 'expect more. pay less'],
+    'Costco': ['costco wholesale', 'costco'],
+    'Starbucks': ['starbucks coffee', 'starbucks'],
+    'McDonald\'s': ['mcdonald', 'i\'m lovin\' it'],
+    'Subway': ['subway', 'eat fresh'],
+    'Home Depot': ['home depot'],
+    'Walgreens': ['walgreens'],
+  };
+
+  for (const [brand, triggers] of Object.entries(brandKeywords)) {
+    if (triggers.some((trigger) => fullTextLower.includes(trigger))) {
+      merchant = brand;
       break;
     }
   }
-  if (merchant === 'Unknown Merchant' && lines.length > 0) {
-    merchant = lines.find((l) => l.length > 3 && !l.match(/^[0-9\W]+$/)) || lines[0];
+
+  // যদি ডিকশনারিতে না মিলে, তবে ওপরের লাইনগুলোর মধ্য থেকে নয়েজ বাদে প্রথম অর্থপূর্ণ নাম নেওয়া
+  if (merchant === 'Unknown Merchant') {
+    for (const line of lines.slice(0, 5)) {
+      // অপ্রয়োজনীয় ছোট নয়েজ বা অদ্ভুত চিহ্ন ফিল্টার
+      const cleaned = line.replace(/[^a-zA-Z0-9\s]/g, '').trim();
+      const isNoise = cleaned.length < 4 || /^[0-9\s]+$/.test(cleaned) || cleaned.toLowerCase().includes('receipt');
+      if (!isNoise) {
+        merchant = cleaned;
+        break;
+      }
+    }
   }
 
-  // ২. Items ও Price আলাদা করা (বারকোড ও X/O/N ফ্ল্যাগ হ্যান্ডলিং)
+  // ২. Items ও Price আলাদা করা
   const items: ReceiptItem[] = [];
   const itemLineRegex = /^(.*?)(?:\s+\d{8,15})?\s+[\$]?([0-9]+\.[0-9]{2})(?:\s*[XONFI\-]*)?$/i;
   const ignoreKeywords = [
@@ -79,7 +100,7 @@ export async function extractReceiptFromImage(imageFile: File): Promise<ParsedRe
     total = items.reduce((sum, itm) => sum + itm.amount, 0);
   }
 
-  // ৪. Date (2-digit সাল যেমন 07/28/17 বা 4-digit সাল সাপোর্ট)
+  // ৪. Date (2-digit বা 4-digit সাল সাপোর্ট)
   let purchasedAt: string | null = null;
   const dateMatch = rawText.match(/\b(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})\b/);
   if (dateMatch) {
