@@ -6,6 +6,7 @@ import { calculateAnalytics } from '@/modules/analytics';
 import { Expense, Category, ParsedReceipt } from '@/contracts/receipt';
 import { extractReceiptFromImage } from '@/modules/receipt-parser/extractor';
 import { categorizeExpense } from '@/modules/expense-categorizer/categorizer';
+import { supabase } from '@/modules/supabase';
 import { 
   UploadCloud, 
   CheckCircle2, 
@@ -29,27 +30,41 @@ export default function DashboardPage() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [reviewData, setReviewData] = useState<ParsedReceipt & { category: Category } | null>(null);
 
-  // ১. LocalStorage থেকে ডেটা লোড
-  useEffect(() => {
-    const saved = localStorage.getItem('receiptiq_expenses');
-    if (saved) {
-      try {
-        setExpenses(JSON.parse(saved));
-      } catch {
+  // ক্লাউড Supabase থেকে ডেটা ফেচ
+  const loadExpenses = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('expenses')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (data && data.length > 0) {
+        const formatted: Expense[] = data.map((d: any) => ({
+          id: d.id,
+          merchant: d.merchant,
+          purchasedAt: d.purchased_at,
+          category: d.category as Category,
+          total: parseFloat(d.total),
+          currency: d.currency || '$',
+          items: d.items || [],
+          rawText: d.raw_text || '',
+          confidence: d.confidence || 1,
+          createdAt: d.created_at,
+        }));
+        setExpenses(formatted);
+      } else {
         setExpenses(INITIAL_EXPENSES);
       }
-    } else {
+    } catch {
       setExpenses(INITIAL_EXPENSES);
+    } finally {
+      setIsLoaded(true);
     }
-    setIsLoaded(true);
-  }, []);
+  };
 
-  // ২. Expenses পরিবর্তন হলে LocalStorage-এ সেভ
   useEffect(() => {
-    if (isLoaded) {
-      localStorage.setItem('receiptiq_expenses', JSON.stringify(expenses));
-    }
-  }, [expenses, isLoaded]);
+    loadExpenses();
+  }, []);
 
   const analytics = calculateAnalytics(expenses);
 
@@ -62,7 +77,6 @@ export default function DashboardPage() {
     }
   };
 
-  // OCR Processing
   const handleProcessReceipt = async () => {
     if (!selectedFile) return;
     setIsProcessing(true);
@@ -83,7 +97,7 @@ export default function DashboardPage() {
     }
   };
 
-  const handleSaveExpense = (e: React.FormEvent) => {
+  const handleSaveExpense = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!reviewData) return;
 
@@ -93,13 +107,27 @@ export default function DashboardPage() {
       createdAt: new Date().toISOString(),
     };
 
+    // ক্লাউড টেবিলে ইনসার্ট
+    await supabase.from('expenses').insert({
+      id: newExpense.id,
+      merchant: newExpense.merchant,
+      purchased_at: newExpense.purchasedAt,
+      category: newExpense.category,
+      total: newExpense.total,
+      currency: newExpense.currency,
+      items: newExpense.items,
+      raw_text: newExpense.rawText,
+      confidence: newExpense.confidence,
+    });
+
     setExpenses([newExpense, ...expenses]);
     setReviewData(null);
     setSelectedFile(null);
     setPreviewUrl(null);
   };
 
-  const handleDeleteExpense = (id: string) => {
+  const handleDeleteExpense = async (id: string) => {
+    await supabase.from('expenses').delete().eq('id', id);
     setExpenses(expenses.filter((e) => e.id !== id));
   };
 
@@ -120,7 +148,7 @@ export default function DashboardPage() {
           </div>
           <span className="bg-emerald-100 text-emerald-800 text-xs px-3 py-1.5 rounded-full font-medium flex items-center gap-1.5">
             <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-            Ready for Demo
+            Cloud Synced
           </span>
         </header>
 
@@ -265,6 +293,20 @@ export default function DashboardPage() {
                   </div>
                 </div>
 
+                {reviewData.items && reviewData.items.length > 0 && (
+                  <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+                    <p className="text-xs font-semibold text-slate-500 uppercase mb-2">Detected Line Items</p>
+                    <div className="space-y-1 max-h-28 overflow-y-auto">
+                      {reviewData.items.map((item, idx) => (
+                        <div key={idx} className="flex justify-between text-xs text-slate-700">
+                          <span>{item.name}</span>
+                          <span className="font-semibold">${item.amount.toFixed(2)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 <button
                   type="submit"
                   className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-medium py-2 rounded-lg transition-colors text-sm"
@@ -304,7 +346,14 @@ export default function DashboardPage() {
                   <tbody className="divide-y divide-slate-100">
                     {expenses.map((exp) => (
                       <tr key={exp.id} className="hover:bg-slate-50">
-                        <td className="py-3 font-medium">{exp.merchant}</td>
+                        <td className="py-3 font-medium">
+                          {exp.merchant}
+                          {exp.items && exp.items.length > 0 && (
+                            <p className="text-xs text-slate-400 font-normal truncate max-w-[200px]">
+                              {exp.items.map((i) => `${i.name} ($${i.amount.toFixed(2)})`).join(', ')}
+                            </p>
+                          )}
+                        </td>
                         <td className="py-3 text-slate-500">{exp.purchasedAt}</td>
                         <td className="py-3">
                           <span className="capitalize px-2 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-700">
