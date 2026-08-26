@@ -1,49 +1,62 @@
 import { createWorker } from 'tesseract.js';
 import { ParsedReceipt, ReceiptItem } from '@/contracts/receipt';
 
-// ছবিকে অপটিমাইজ করা
+// ব্রাউজার-ইন্ডিপেনডেন্ট ইমেজ অপটিমাইজেশন (FileReader ভিত্তিক নিরাপদ লোডার)
 async function preprocessReceiptImage(file: File): Promise<Blob> {
   return new Promise((resolve) => {
-    const img = new Image();
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return resolve(file);
-
-      // রেজোলিউশন ব্যালেন্স
-      const maxDim = 1800;
-      let width = img.width;
-      let height = img.height;
-      if (width > maxDim || height > maxDim) {
-        if (width > height) {
-          height = Math.round((height * maxDim) / width);
-          width = maxDim;
-        } else {
-          width = Math.round((width * maxDim) / height);
-          height = maxDim;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        if (!ctx) {
+          resolve(file);
+          return;
         }
-      }
 
-      canvas.width = width;
-      canvas.height = height;
-      ctx.drawImage(img, 0, 0, width, height);
+        const maxDim = 1600;
+        let width = img.width;
+        let height = img.height;
 
-      const imgData = ctx.getImageData(0, 0, width, height);
-      const d = imgData.data;
+        if (width > maxDim || height > maxDim) {
+          if (width > height) {
+            height = Math.round((height * maxDim) / width);
+            width = maxDim;
+          } else {
+            width = Math.round((width * maxDim) / height);
+            height = maxDim;
+          }
+        }
 
-      for (let i = 0; i < d.length; i += 4) {
-        const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-        // সফট কনট্রাস্ট (টেক্সটের ডট নষ্ট না করে ব্যাকগ্রাউন্ড হালকা করা)
-        const v = gray > 180 ? 255 : gray < 90 ? 0 : gray;
-        d[i] = v;
-        d[i + 1] = v;
-        d[i + 2] = v;
-      }
+        canvas.width = width;
+        canvas.height = height;
 
-      ctx.putImageData(imgData, 0, 0);
-      canvas.toBlob((blob) => resolve(blob || file), 'image/png');
+        // হোয়াইট ব্যাকগ্রাউন্ড ও ড্র
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, width, height);
+        ctx.drawImage(img, 0, 0, width, height);
+
+        const imgData = ctx.getImageData(0, 0, width, height);
+        const d = imgData.data;
+
+        // কালার ব্যালেন্সিং ও নয়েজ রিমুভাল
+        for (let i = 0; i < d.length; i += 4) {
+          const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+          const val = gray < 165 ? Math.max(0, gray - 40) : 255;
+          d[i] = val;
+          d[i + 1] = val;
+          d[i + 2] = val;
+        }
+
+        ctx.putImageData(imgData, 0, 0);
+        canvas.toBlob((blob) => resolve(blob || file), 'image/png', 1.0);
+      };
+      img.onerror = () => resolve(file);
+      img.src = e.target?.result as string;
     };
-    img.src = URL.createObjectURL(file);
+    reader.onerror = () => resolve(file);
+    reader.readAsDataURL(file);
   });
 }
 
@@ -76,23 +89,25 @@ function formatToValidDate(yearStr: string, monthStr: string, dayStr: string): s
 export async function extractReceiptFromImage(imageFile: File): Promise<ParsedReceipt> {
   const processedBlob = await preprocessReceiptImage(imageFile);
   const worker = await createWorker('eng');
-  
-  // প্রসেসড ইমেজ দিয়ে স্ক্যান
   const ret = await worker.recognize(processedBlob);
   await worker.terminate();
 
   const rawText = ret.data.text;
-  const lines = rawText.split('\n').map((l) => l.trim()).filter(Boolean);
+  const lines = rawText
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+
   const fullTextLower = rawText.toLowerCase();
 
-  // ১. কারেন্সি নির্ধারণ
+  // ১. কারেন্সি
   let currency = '$';
   if (fullTextLower.includes('chf')) currency = 'CHF';
   else if (fullTextLower.includes('€') || fullTextLower.includes('eur')) currency = '€';
   else if (fullTextLower.includes('£') || fullTextLower.includes('gbp')) currency = '£';
   else if (fullTextLower.includes('tk') || fullTextLower.includes('bdt')) currency = 'Tk';
 
-  // ২. মার্চেন্ট নেম নির্ধারণ
+  // ২. মার্চেন্ট
   let merchant = 'Unknown Merchant';
   const brandKeywords: { [key: string]: string[] } = {
     'Berghotel Grosse Scheidegg': ['berghotel', 'grosse scheidegg', 'scheidegg', 'grindelwald', 'müller', 'muller'],
@@ -119,7 +134,7 @@ export async function extractReceiptFromImage(imageFile: File): Promise<ParsedRe
     }
   }
 
-  // ৩. লাইন আইটেমস পার্সিং (ফ্লেক্সিবল ডট/কমা এবং কোয়ান্টিটি ফিল্টার)
+  // ৩. লাইন আইটেমস পার্সিং (ফ্লেক্সিবল ম্যাচিং যা কোনো ডিভাইস মিস করবে না)
   const items: ReceiptItem[] = [];
   const ignoreKeywords = [
     'total', 'subtotal', 'tax', 'mwst', 'vat', 'cash', 'change', 'visa', 'debit',
@@ -131,7 +146,7 @@ export async function extractReceiptFromImage(imageFile: File): Promise<ParsedRe
     const lower = line.toLowerCase();
     if (ignoreKeywords.some((kw) => lower.startsWith(kw) || lower.includes('total') || lower.includes('mwst'))) continue;
 
-    // লাইনের যেকোনো জায়গায় মূল আইটেম ও প্রাইস প্যাটার্ন
+    // যেকোনো লাইনের শেষ প্রাইস ধরা (যেমন 9.00, 5.00, 22.00, 18.50)
     const match = line.match(/^(.+?)(?:\s+à|\s+@|\s+CHF|\s+\$|\s+€|\s+EUR)?\s*([0-9]+[.,][0-9]{2})(?:\s*[XONFI\-]*)?$/i);
     if (match && match[1] && match[2]) {
       let name = match[1]
@@ -151,15 +166,12 @@ export async function extractReceiptFromImage(imageFile: File): Promise<ParsedRe
     }
   }
 
-  // ৪. টোটাল অ্যামাউন্ট পার্সিং
+  // ৪. টোটাল অ্যামাউন্ট
   let total: number | null = null;
-
   for (const line of lines) {
     const lower = line.toLowerCase();
-    // ভ্যাট, সাবটোটাল বা ইউরো কনভার্সন লাইন বাদ
     if (lower.includes('subtotal') || lower.includes('mwst') || lower.includes('tax') || lower.includes('entspricht')) continue;
 
-    // Total বা CHF এর পর বড় ফন্টে থাকা প্রাইস
     const match = line.match(/(?:TOTAL|SUMME|GESAMT|AMOUNT)[\s:;=CHF$€£]*([0-9]+[.,][0-9]{2})/i);
     if (match && match[1]) {
       total = cleanNumber(match[1]);
@@ -167,7 +179,6 @@ export async function extractReceiptFromImage(imageFile: File): Promise<ParsedRe
     }
   }
 
-  // যদি সরাসরি কি-ওয়ার্ডে না পায়
   if (total === null) {
     const standaloneMatch = rawText.match(/(?:Total\s*:\s*CHF|Total\s*:|TOTAL)\s*([0-9]+[.,][0-9]{2})/i);
     if (standaloneMatch && standaloneMatch[1]) {
@@ -175,26 +186,37 @@ export async function extractReceiptFromImage(imageFile: File): Promise<ParsedRe
     }
   }
 
-  // ব্যাকআপ হিসেবে আইটেমস যোগফল
   if ((total === null || total === 0) && items.length > 0) {
     total = parseFloat(items.reduce((s, itm) => s + itm.amount, 0).toFixed(2));
   }
 
-  // ৫. ডেট পার্সিং (DD.MM.YYYY ও সব ধরণের সংযুক্ত টাইমস্ট্যাম্প হ্যান্ডলিং)
+  // ৫. ইউনিভার্সাল ডেট স্ক্যানিং (পুরো টেক্সট এবং লাইন বাই লাইন গভীর সার্চ)
   let purchasedAt: string | null = null;
 
-  for (const line of lines) {
-    if (line.toLowerCase().includes('tel') || line.toLowerCase().includes('fax')) continue;
+  // ১. পুরো রসিদে 30.07.2007 বা 30/07/2007 খোঁজা (টাইমস্ট্যাম্প সহ থাকলেও ধরবে)
+  const fullTextDateMatch = rawText.match(/\b([0-3]?[0-9])[\.\/\-]([0-1]?[0-9])[\.\/\-](19\d\d|20\d\d|\d{2})\b/);
+  if (fullTextDateMatch) {
+    const p1 = parseInt(fullTextDateMatch[1], 10);
+    if (p1 > 12) {
+      purchasedAt = formatToValidDate(fullTextDateMatch[3], fullTextDateMatch[2], fullTextDateMatch[1]);
+    } else {
+      purchasedAt = formatToValidDate(fullTextDateMatch[3], fullTextDateMatch[1], fullTextDateMatch[2]);
+    }
+  }
 
-    // 30.07.2007 বা 30/07/2007
-    const m = line.match(/\b([0-3]?[0-9])[\.\/\-]([0-1]?[0-9])[\.\/\-](19\d\d|20\d\d|\d{2})\b/);
-    if (m) {
-      if (parseInt(m[1], 10) > 12) {
-        purchasedAt = formatToValidDate(m[3], m[2], m[1]);
-      } else {
-        purchasedAt = formatToValidDate(m[3], m[1], m[2]);
+  // ২. যদি উপরে না পায় তবে লাইন ধরে স্ক্যান
+  if (!purchasedAt) {
+    for (const line of lines) {
+      if (line.toLowerCase().includes('tel') || line.toLowerCase().includes('fax')) continue;
+      const m = line.match(/\b([0-3]?[0-9])[\.\/\-]([0-1]?[0-9])[\.\/\-](19\d\d|20\d\d|\d{2})\b/);
+      if (m) {
+        if (parseInt(m[1], 10) > 12) {
+          purchasedAt = formatToValidDate(m[3], m[2], m[1]);
+        } else {
+          purchasedAt = formatToValidDate(m[3], m[1], m[2]);
+        }
+        if (purchasedAt) break;
       }
-      if (purchasedAt) break;
     }
   }
 
